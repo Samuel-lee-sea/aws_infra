@@ -1,0 +1,162 @@
+name: Integration Tests
+
+on:
+  workflow_dispatch: 
+    inputs:
+      environment:
+        description: 'Environment to run tests against'
+        type: environment
+        required: true
+        default: 'AWS_DEPLOYMENT'
+
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  assignment-grader:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      - name: Disable Terraform Debug
+        run: echo "TF_LOG=ERROR" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Check Format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Set Terraform Variables
+        run: |
+          touch terraform.tfvars
+          echo "webapp_ami_id = \"${{ vars.WEBAPP_AMI_ID }}\"" >> terraform.tfvars
+          echo "mysql_ami_id = \"${{ vars.MYSQL_AMI_ID }}\"" >> terraform.tfvars
+          echo "database_username = \"${{ vars.DATABASE_USERNAME }}\"" >> terraform.tfvars
+          echo "database_password = \"${{ secrets.DATABASE_PASSWORD }}\"" >> terraform.tfvars
+          echo "webapp_secret_key = \"${{ secrets.WEBAPP_SECRET_KEY }}\"" >> terraform.tfvars
+          cat terraform.tfvars
+
+      - name: Terraform Plan
+        run: terraform plan
+
+      - name: Clean up EIP resources
+        run: |
+          echo "Cleaning up EIPs..."
+          
+
+          EXCLUDE_INSTANCES=("i-0bcadaba7985e939d" "i-01be2a173a106b678")
+          
+        
+          echo "Current EIPs:"
+          aws ec2 describe-addresses
+
+          echo "Cleaning unassociated EIPs..."
+          aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].[AllocationId]' --output text | while read -r id; do
+            if [ ! -z "$id" ]; then
+              echo "Releasing EIP: $id"
+              aws ec2 release-address --allocation-id "$id"
+            fi
+          done
+          
+          echo "Cleaning non-excluded EIPs..."
+          for id in $(aws ec2 describe-addresses --query 'Addresses[].[AllocationId]' --output text); do
+   
+            INSTANCE_ID=$(aws ec2 describe-addresses --allocation-ids "$id" --query 'Addresses[0].InstanceId' --output text)
+            SKIP=false
+            for exclude in "${EXCLUDE_INSTANCES[@]}"; do
+              if [ "$INSTANCE_ID" == "$exclude" ]; then
+                echo "Skipping EIP $id (associated with excluded instance $INSTANCE_ID)"
+                SKIP=true
+                break
+              fi
+            done
+            
+            if [ "$SKIP" == "false" ]; then
+              echo "Processing EIP: $id"
+              aws ec2 disassociate-address --allocation-id "$id" || true
+              aws ec2 release-address --allocation-id "$id" || true
+            fi
+          done
+          
+
+          echo "Remaining EIPs after cleanup:"
+          aws ec2 describe-addresses
+
+      - name: Wait for cleanup
+        run: sleep 10
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      - name: Terraform Output
+        run: |
+          WEBAPP_PUBLIC_IP=$(terraform output -raw webapp_public_ip)
+          echo "WEBAPP_PUBLIC_IP=$WEBAPP_PUBLIC_IP" >> $GITHUB_ENV
+          echo "WEBAPP_PUBLIC_IP=$WEBAPP_PUBLIC_IP"
+
+      - name: Wait for Web App to Start
+        run: sleep 30
+
+      - name: Wait for Health Check
+        run: |
+          for i in {1..10}; do
+            curl -s -o /dev/null -w "%{http_code}" http://$WEBAPP_PUBLIC_IP/v1/healthcheck | grep 200 && break
+            echo "Waiting for Web App to be healthy..."
+            sleep 15
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install Dependencies
+        run: pip install pytest requests
+
+      - name: Run API Integration Tests
+        env:
+          WEBAPP_IP: ${{ env.WEBAPP_PUBLIC_IP }}
+        run: |
+          cd assignment6
+          pytest --tb=short --maxfail=5 | tee pytest_results.txt
+
+      - name: Upload Test Results (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: pytest_results.txt
+
+      - name: Terraform Destroy
+        if: always()
+        continue-on-error: true
+        run: |
+          terraform destroy -auto-approve
+          
+          echo "Final cleanup of resources..."
+          aws ec2 describe-addresses --query 'Addresses[].[AllocationId]' --output text | while read -r id; do
+            aws ec2 disassociate-address --allocation-id "$id" || true
+            aws ec2 release-address --allocation-id "$id" || true
+          done
+      

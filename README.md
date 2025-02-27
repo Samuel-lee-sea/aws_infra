@@ -1,1 +1,1 @@
-# terraform-grader
+# terraform
